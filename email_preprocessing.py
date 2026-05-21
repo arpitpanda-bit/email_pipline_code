@@ -486,9 +486,16 @@ def _remove_line_noise(text: str) -> str:
     lines = text.split("\n")
     out = []
     for line in lines:
-        line = re.sub(r"\s*\|+\s*$", "", line)
+        line = re.sub(r"^\s*\|+\s*", "", line)  # strip leading pipes
+        line = re.sub(r"\s*\|+\s*$", "", line)  # strip trailing pipes
         line = re.sub(r"<[a-zA-Z/!][^>@]*>", "", line)
         line = re.sub(r"&[a-zA-Z]+;|&#\d+;|&#x[0-9a-fA-F]+;", " ", line)
+        # Skip lines that are only pipes, dashes, whitespace, colons, or equals
+        if _PIPE_ONLY.match(line):
+            continue
+        # Skip lines that are just a lone pipe
+        if line.strip() == "|":
+            continue
         out.append(line)
     return "\n".join(out)
 
@@ -797,13 +804,13 @@ def clean_email_body(raw: str, keep_history: bool = True) -> str:
     current_depth = 0
     reply_counter = 1
     
-    if keep_history:
+    '''if keep_history:
         first_banner = "--- Reply 1"
         if reply_1_sender:
             first_banner += f" ({reply_1_sender})"
         first_banner += " ---"
         cleaned_lines.append(first_banner)
-        cleaned_lines.append("")
+        cleaned_lines.append("")'''
         
     for idx, line in enumerate(lines):
         s_line = line.strip()
@@ -816,15 +823,6 @@ def clean_email_body(raw: str, keep_history: bool = True) -> str:
                 sender = info["sender"]
                 
                 reply_counter += 1
-                banner = f"--- Reply {reply_counter}"
-                if sender:
-                    banner += f" ({sender})"
-                banner += " ---"
-                
-
-                cleaned_lines.append("")
-                cleaned_lines.append(banner)
-                cleaned_lines.append("")
                 
                 # Update current_depth to prevent double-triggering
                 next_depth = info["depth"]
@@ -848,9 +846,6 @@ def clean_email_body(raw: str, keep_history: bool = True) -> str:
             
             if depth > current_depth:
                 reply_counter += 1
-                cleaned_lines.append("")
-                cleaned_lines.append(f"--- Reply {reply_counter} ---")
-                cleaned_lines.append("")
                 current_depth = depth
             elif depth < current_depth:
                 current_depth = depth

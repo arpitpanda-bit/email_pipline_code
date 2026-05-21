@@ -2,6 +2,11 @@ import json
 import hashlib
 import re
 import sys
+
+# Fix Windows console encoding — cp1252 can't render Unicode box-drawing/symbols
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import pandas as pd
 # pyrefly: ignore [missing-import]
 import numpy as np
@@ -17,7 +22,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # CONFIGURATION — just the filename, script resolves path automatically
 # ═══════════════════════════════════════════════════════════════════
 
-JSON_FILE = "aviso_logic_monitor_email_eid_level.json"   # any {eid: html_body} JSON file
+JSON_FILE = "armis_raw_email.json"   # any {eid: html_body} JSON file
 
 TFIDF_THRESHOLD = 0.50
 JACCARD_THRESHOLD = 0.35
@@ -221,24 +226,14 @@ def load_and_dedup():
 # STEP 2: EXTRACT TEXT FROM HTML BODIES
 # ═══════════════════════════════════════════════════════════════════
 
-def html_to_text(html_str):
-    """Strip HTML tags, return plain text."""
-    if not html_str or not isinstance(html_str, str):
-        return ""
-    try:
-        soup = BeautifulSoup(html_str, "html.parser")
-        return soup.get_text(separator=" ", strip=True)
-    except Exception:
-        return re.sub(r"<[^>]+>", " ", str(html_str))
-
-
 def extract_bodies(df):
     """Extract plain text from raw HTML bodies."""
     print("=" * 60)
     print("STEP 2: Extracting text from HTML bodies")
     print("=" * 60)
 
-    df["body_text"] = df["raw_body"].apply(html_to_text)
+    from armis_email_preprocessing import clean_email_body
+    df["body_text"] = df["raw_body"].apply(lambda x: clean_email_body(str(x), keep_history=True) if pd.notnull(x) else "")
     df["body_text"] = df["body_text"].fillna("").str.strip()
 
     non_empty = (df["body_text"].str.len() > 10).sum()
@@ -514,7 +509,14 @@ def generate_outputs(df, chosen_method, dedup_stats, winner_metrics,
     csv_columns = [c for c in csv_columns if c in df.columns]
 
     csv_out = OUTPUT_DIR / "threaded_emails_rich_v2.csv"
-    df[csv_columns].to_csv(csv_out, index=False)
+    
+    # Strip newlines from body text for the CSV to prevent spreadsheet parsing errors
+    df_export = df[csv_columns].copy()
+    if "body_text" in df_export.columns:
+        df_export["body_text"] = df_export["body_text"].astype(str).str.replace(r"[\r\n]+", " ", regex=True)
+    
+    # Use utf-8-sig so Excel recognizes the encoding and handles quotes correctly
+    df_export.to_csv(csv_out, index=False, encoding="utf-8-sig")
     print(f"  ✓ Saved: {csv_out}")
 
     # Save thread summary JSON
@@ -652,7 +654,7 @@ Each thread in `thread_summary.json` contains:
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    print("\n" + "═" * 60)
+    print("\n" + "=" * 60)
     print("  EMAIL THREAD GROUPING PIPELINE")
     print(f"  Source: {JSON_FILE}")
     print("  Body-based similarity • No subject used")
