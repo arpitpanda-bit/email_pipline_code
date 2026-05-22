@@ -18,14 +18,22 @@ from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from armis_email_preprocessing import clean_email_body
+
 # ═══════════════════════════════════════════════════════════════════
 # CONFIGURATION — just the filename, script resolves path automatically
 # ═══════════════════════════════════════════════════════════════════
 
 JSON_FILE = "armis_raw_email.json"   # any {eid: html_body} JSON file
 
-TFIDF_THRESHOLD = 0.50
+TFIDF_THRESHOLD = 0.59
 JACCARD_THRESHOLD = 0.35
+
+# Near-identical threshold: pairs above this are likely template/mass emails
+# sent to different recipients — they should NOT be merged into one thread.
+# In a real conversation thread, replies add new content, so similarity is
+# typically 0.5–0.95, never 0.99+.
+NEAR_IDENTICAL_THRESHOLD = 0.99
 
 # Resolve paths relative to the script's own directory
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -227,18 +235,35 @@ def load_and_dedup():
 # ═══════════════════════════════════════════════════════════════════
 
 def extract_bodies(df):
-    """Extract plain text from raw HTML bodies."""
+    """Extract plain text from raw HTML bodies.
+
+    Produces two columns:
+      - body_text:     full text with reply history (keep_history=True)
+                       used for similarity computation / thread grouping.
+      - cleaned_body:  latest reply only (keep_history=False)
+                       the final cleaned output for downstream use.
+    """
     print("=" * 60)
     print("STEP 2: Extracting text from HTML bodies")
     print("=" * 60)
 
-    from armis_email_preprocessing import clean_email_body
-    df["body_text"] = df["raw_body"].apply(lambda x: clean_email_body(str(x), keep_history=True) if pd.notnull(x) else "")
+    # Full body with reply chain — used for similarity-based threading
+    df["body_text"] = df["raw_body"].apply(
+        lambda x: clean_email_body(str(x), keep_history=True) if pd.notnull(x) else ""
+    )
     df["body_text"] = df["body_text"].fillna("").str.strip()
+
+    # Cleaned body — latest reply only, for downstream consumption
+    df["cleaned_body"] = df["raw_body"].apply(
+        lambda x: clean_email_body(str(x), keep_history=False) if pd.notnull(x) else ""
+    )
+    df["cleaned_body"] = df["cleaned_body"].fillna("").str.strip()
 
     non_empty = (df["body_text"].str.len() > 10).sum()
     avg_len = df.loc[df["body_text"].str.len() > 10, "body_text"].str.len().mean()
-    print(f"  Non-empty bodies: {non_empty}/{len(df)}")
+    cleaned_non_empty = (df["cleaned_body"].str.len() > 10).sum()
+    print(f"  Non-empty bodies (full):    {non_empty}/{len(df)}")
+    print(f"  Non-empty bodies (cleaned): {cleaned_non_empty}/{len(df)}")
     print(f"  Avg body length: {avg_len:.0f} chars\n")
 
     return df
@@ -294,11 +319,99 @@ def compute_tfidf_matrix(df):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# STEP 3.5: MESSAGE-ID REFERENCE DETECTION
+# ═══════════════════════════════════════════════════════════════════
+
+def detect_message_id_links(df):
+    """Detect emails that reference another email's Message-ID in the HTML body.
+
+    Returns a set of (i, j) index pairs that should be forcibly linked,
+    regardless of body similarity thresholds.
+    """
+    links = set()
+    eids = df["eid"].tolist()
+    bodies = df["raw_body"].tolist()
+    eid_to_idx = {eid: idx for idx, eid in enumerate(eids)}
+
+    for idx, raw in enumerate(bodies):
+        if not isinstance(raw, str):
+            continue
+        for other_eid, other_idx in eid_to_idx.items():
+            if other_idx != idx and other_eid in raw:
+                pair = (min(idx, other_idx), max(idx, other_idx))
+                links.add(pair)
+
+    return links
+
+
+# ═══════════════════════════════════════════════════════════════════
 # STEP 4: CLUSTERING — CONNECTED COMPONENTS
 # ═══════════════════════════════════════════════════════════════════
 
-def find_clusters(sim_matrix, threshold):
-    """Find connected components where similarity > threshold."""
+def _split_duplicate_bodies(clusters, body_texts):
+    """Post-process clusters to split out duplicate-body emails.
+
+    When identical-body emails end up in the same cluster through
+    transitive connections (e.g. both are similar to a shared reply),
+    keep only one copy of each unique body in the cluster and eject
+    the rest as singletons.
+
+    Example:  A and B have identical bodies (template emails sent to
+    different people).  C is a reply to A.  Union-find merges A–C and
+    B–C, producing cluster {A, B, C}.  This function splits it into
+    thread {A, C} + singleton {B}.
+    """
+    new_clusters = {}
+    cluster_id = 0
+
+    for root, members in clusters.items():
+        if len(members) <= 1:
+            new_clusters[cluster_id] = members
+            cluster_id += 1
+            continue
+
+        # Group members by body text hash
+        body_groups = defaultdict(list)
+        for idx in members:
+            body = body_texts[idx] if idx < len(body_texts) else ""
+            body_hash = hashlib.md5(body.encode()).hexdigest()
+            body_groups[body_hash].append(idx)
+
+        # For each body that appears multiple times, keep the first
+        # occurrence in the cluster and eject the rest as singletons
+        keep = []
+        eject = []
+        for body_hash, indices in body_groups.items():
+            keep.append(indices[0])       # keep first occurrence
+            eject.extend(indices[1:])     # eject duplicates
+
+        if eject:
+            new_clusters[cluster_id] = keep
+            cluster_id += 1
+            for idx in eject:
+                new_clusters[cluster_id] = [idx]
+                cluster_id += 1
+        else:
+            new_clusters[cluster_id] = members
+            cluster_id += 1
+
+    return new_clusters
+
+
+def find_clusters(sim_matrix, threshold, message_id_links=None,
+                  body_texts=None):
+    """Find connected components where similarity > threshold.
+
+    Three critical guards against over-merging:
+    1. Near-identical pairs (sim >= 0.99) are SKIPPED — these are
+       template/mass emails with identical content sent to different
+       recipients.  In a real reply thread the reply adds new text,
+       so similarity is typically 0.5–0.95.
+    2. Message-ID reference pairs are ALWAYS merged, regardless of
+       similarity, because they are definitively part of the same thread.
+    3. Post-processing splits out duplicate-body emails that got merged
+       transitively through shared intermediate emails.
+    """
     n = sim_matrix.shape[0]
     parent = list(range(n))
 
@@ -313,14 +426,28 @@ def find_clusters(sim_matrix, threshold):
         if ra != rb:
             parent[ra] = rb
 
+    # Phase 1: Force-merge Message-ID reference pairs
+    if message_id_links:
+        for i, j in message_id_links:
+            union(i, j)
+
+    # Phase 2: Merge by body similarity, but skip near-identical pairs
     for i in range(n):
         for j in range(i + 1, n):
-            if sim_matrix[i][j] >= threshold:
+            sim = sim_matrix[i][j]
+            # Skip near-identical pairs (template/mass emails)
+            if sim >= NEAR_IDENTICAL_THRESHOLD:
+                continue
+            if sim >= threshold:
                 union(i, j)
 
     clusters = defaultdict(list)
     for i in range(n):
         clusters[find(i)].append(i)
+
+    # Phase 3: Split out duplicate-body emails merged transitively
+    if body_texts is not None:
+        clusters = _split_duplicate_bodies(clusters, body_texts)
 
     return dict(clusters)
 
@@ -341,9 +468,12 @@ def assign_thread_ids(df, clusters):
 # STEP 5: EVALUATE BOTH APPROACHES
 # ═══════════════════════════════════════════════════════════════════
 
-def evaluate_approach(df, sim_matrix, threshold, method_name):
+def evaluate_approach(df, sim_matrix, threshold, method_name,
+                      message_id_links=None, body_texts=None):
     """Evaluate a clustering approach and return metrics."""
-    clusters = find_clusters(sim_matrix, threshold)
+    clusters = find_clusters(sim_matrix, threshold,
+                             message_id_links=message_id_links,
+                             body_texts=body_texts)
     n_threads = len(clusters)
     sizes = [len(m) for m in clusters.values()]
     singletons = sum(1 for s in sizes if s == 1)
@@ -384,14 +514,28 @@ def run_evaluation(df):
     print("STEP 3-4: Fallback Evaluation — Jaccard vs TF-IDF")
     print("=" * 60)
 
+    # Detect Message-ID reference links (primary grouping signal)
+    print("  Detecting Message-ID cross-references...")
+    message_id_links = detect_message_id_links(df)
+    print(f"  Found {len(message_id_links)} Message-ID reference pairs")
+
+    # Count near-identical pairs that will be skipped
+    print(f"  Near-identical threshold: {NEAR_IDENTICAL_THRESHOLD} "
+          f"(template/mass emails above this are kept as singletons)")
+
+    # Extract body texts for duplicate-body post-processing
+    body_texts = df["body_text"].tolist()
+
     jac_matrix = compute_jaccard_matrix(df)
     jac_clusters, jac_metrics = evaluate_approach(
-        df, jac_matrix, JACCARD_THRESHOLD, "Jaccard"
+        df, jac_matrix, JACCARD_THRESHOLD, "Jaccard",
+        message_id_links=message_id_links, body_texts=body_texts
     )
 
     tfidf_matrix = compute_tfidf_matrix(df)
     tfidf_clusters, tfidf_metrics = evaluate_approach(
-        df, tfidf_matrix, TFIDF_THRESHOLD, "TF-IDF Cosine"
+        df, tfidf_matrix, TFIDF_THRESHOLD, "TF-IDF Cosine",
+        message_id_links=message_id_links, body_texts=body_texts
     )
 
     print(f"\n  {'Metric':<30} {'Jaccard':>12} {'TF-IDF':>12}")
@@ -503,17 +647,18 @@ def generate_outputs(df, chosen_method, dedup_stats, winner_metrics,
         "eid", "thread_id", "grouping_method",
         "from", "to", "cc", "subject", "date", "timestamp",
         "reply_depth", "participant_count", "participants_str",
-        "body_text",
+        "cleaned_body", "body_text",
     ]
     # Only include columns that actually exist
     csv_columns = [c for c in csv_columns if c in df.columns]
 
     csv_out = OUTPUT_DIR / "threaded_emails_rich_v2.csv"
     
-    # Strip newlines from body text for the CSV to prevent spreadsheet parsing errors
+    # Strip newlines from body columns for the CSV to prevent spreadsheet parsing errors
     df_export = df[csv_columns].copy()
-    if "body_text" in df_export.columns:
-        df_export["body_text"] = df_export["body_text"].astype(str).str.replace(r"[\r\n]+", " ", regex=True)
+    for col in ["body_text", "cleaned_body"]:
+        if col in df_export.columns:
+            df_export[col] = df_export[col].astype(str).str.replace(r"[\r\n]+", " ", regex=True)
     
     # Use utf-8-sig so Excel recognizes the encoding and handles quotes correctly
     df_export.to_csv(csv_out, index=False, encoding="utf-8-sig")
